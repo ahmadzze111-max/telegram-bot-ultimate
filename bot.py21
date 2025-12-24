@@ -1,0 +1,1690 @@
+# -*- coding: utf-8 -*-
+"""
+bot_ultimate_pro_v14_dollar.py
+تحديث شامل V14:
+1. نظام التسعير بالدولار (سعر صرف متغير).
+2. تبديل العملة للمستخدم (USD/SYR).
+3. طبقة الوسيط (Mediator) الاختيارية.
+4. تعليمات السيرفر.
+5. دعم كامل للفواصل العشرية.
+"""
+
+import telebot
+from telebot import types
+import sqlite3
+import threading
+import time
+import os
+import requests
+import random
+import math
+import datetime
+
+# ================= إعدادات البوت =================
+# ضع التوكين الخاص بك هنا
+TOKEN = "8052662195:AAGSY5fv37_MSqzWCvf2y29fN--Mr0SrxVw"
+ADMIN_ID = 6342993961
+DB_FILE = "bot_ultimate_v14.db" 
+CHANNEL_USERNAME = "ahmadasadalsh"
+
+# إعدادات Big Boss API
+BIG_BOSS_API_URL = "https://api.big-boss-store.com/big-boos/api/client/order"
+BIG_BOSS_API_TOKEN = "c9d27c8da440c0be70cbe0db92474a0a6fa69e8a2fadaef3d041fa6d559e2c84"
+
+# إعدادات مالية
+WITHDRAW_FEE_PERCENT = 2
+
+bot = telebot.TeleBot(TOKEN)
+db_lock = threading.Lock()
+admin_states = {} 
+
+# ================= قاعدة البيانات =================
+def init_db():
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        
+        # 1. المستخدمين
+        cur.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance REAL DEFAULT 0,
+            level INTEGER DEFAULT 0,
+            total_spent REAL DEFAULT 0,
+            banned INTEGER DEFAULT 0,
+            join_date INTEGER
+        )""")
+        
+        # [جديد] إضافة عمود لتفضيل العملة للمستخدم
+        try: cur.execute("ALTER TABLE users ADD COLUMN currency_pref TEXT DEFAULT 'SYR'")
+        except: pass
+
+        # 2. الإعدادات
+        cur.execute("""CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+
+        # 3. طرق الدفع
+        cur.execute("""CREATE TABLE IF NOT EXISTS payment_methods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            account_number TEXT,
+            details TEXT
+        )""")
+
+        # 4. سجل العمليات المالية
+        cur.execute("""CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT, 
+            amount REAL,
+            method_name TEXT,
+            user_account TEXT,
+            proof_image TEXT,
+            status TEXT, 
+            date INTEGER
+        )""")
+
+        # 5. جداول المتجر
+        cur.execute("""CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT, image_url TEXT)""")
+        
+        try: cur.execute("ALTER TABLE groups ADD COLUMN is_active INTEGER DEFAULT 1")
+        except: pass
+
+        # [جديد] جدول الوسيط (Mediators) - اختياري
+        cur.execute("""CREATE TABLE IF NOT EXISTS mediators (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER,
+            name TEXT
+        )""")
+
+        # جدول المنتجات
+        cur.execute("""CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, name TEXT, price REAL, api_product_id TEXT)""")
+        
+        # التحديثات السابقة + الجديدة
+        try: cur.execute("ALTER TABLE products ADD COLUMN is_quantity INTEGER DEFAULT 0")
+        except: pass
+        try: cur.execute("ALTER TABLE products ADD COLUMN cost_price REAL DEFAULT 0")
+        except: pass
+        try: cur.execute("ALTER TABLE products ADD COLUMN min_qty INTEGER DEFAULT 1")
+        except: pass
+        
+        # [جديد] السعر بالدولار + ربط الوسيط
+        try: cur.execute("ALTER TABLE products ADD COLUMN price_usd REAL DEFAULT 0") # السعر بالدولار
+        except: pass
+        try: cur.execute("ALTER TABLE products ADD COLUMN mediator_id INTEGER DEFAULT 0") # ربط بالوسيط
+        except: pass
+
+        # 6. المستويات
+        cur.execute("""CREATE TABLE IF NOT EXISTS levels (level_id INTEGER PRIMARY KEY, name TEXT, discount_percent REAL, upgrade_cost INTEGER)""")
+     
+        # 7. الطلبات
+        cur.execute("""CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, user_id INTEGER, product_name TEXT, price_paid REAL, api_status TEXT, created_at INTEGER, status TEXT)""")
+     
+        try: cur.execute("ALTER TABLE orders ADD COLUMN quantity INTEGER DEFAULT 1")
+        except: pass
+        try: cur.execute("ALTER TABLE orders ADD COLUMN cost_at_purchase REAL DEFAULT 0")
+        except: pass
+
+        # 8. جدول السحب
+        cur.execute("""CREATE TABLE IF NOT EXISTS raffle_entries (
+            user_id INTEGER PRIMARY KEY,
+            join_date INTEGER
+        )""")
+
+        # بيانات افتراضية للمستويات
+        cur.execute("SELECT COUNT(*) FROM levels")
+        if cur.fetchone()[0] == 0:
+            default_levels = [
+                (0, "🆕 مبتدئ", 0.0, 0),
+                (1, "🥉 برونزي", 2.0, 25000),
+                (2, "🥈 فضي", 5.0, 75000),
+                (3, "🥇 ذهبي", 8.0, 150000),
+                (4, "💎 ماسي", 12.0, 300000)
+            ]
+            cur.executemany("INSERT INTO levels VALUES (?,?,?,?)", default_levels)
+
+        # إعدادات افتراضية
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("start_msg", "👋 أهلاً بك في بوت الخدمات الأفضل!"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("terms_msg", "📜 **الشروط والأحكام:**\n1. جميع المبيعات نهائية."))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("support_msg", "☎️ **الدعم الفني:**\nتواصل معنا عبر المعرف: @YourUser"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("maintenance", "0"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("order_counter", "0"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("raffle_fee", "1000"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("raffle_prize", "12000"))
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("raffle_min_users", "14"))
+
+        # [جديد] إعدادات الدولار والوسيط
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("dollar_rate", "15000")) # سعر الصرف الافتراضي
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("enable_user_currency", "1")) # السماح للزبون بتغيير العملة
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", ("enable_mediator", "0")) # تفعيل الوسيط
+
+        conn.commit()
+        conn.close()
+
+def db_query(query, args=(), fetch=False, commit=False):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute(query, args)
+        res = None
+        if fetch: res = cur.fetchall()
+        if commit: conn.commit()
+        conn.close()
+        return res
+
+def get_setting(key):
+    res = db_query("SELECT value FROM settings WHERE key=?", (key,), fetch=True)
+    return res[0][0] if res else "0"
+
+def set_setting(key, value):
+    db_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value), commit=True)
+
+def get_next_order_id():
+    current = int(get_setting("order_counter"))
+    next_id = current + 1
+    set_setting("order_counter", str(next_id))
+    return next_id
+
+init_db()
+
+# ================= دوال مساعدة وحسابات =================
+def get_user(user_id):
+    res = db_query("SELECT * FROM users WHERE id=?", (user_id,), fetch=True)
+    return res[0] if res else None
+
+def register_user(user_id, username):
+    if not get_user(user_id):
+        db_query("INSERT INTO users (id, username, join_date) VALUES (?, ?, ?)", (user_id, username, int(time.time())), commit=True)
+        try:
+            bot.send_message(ADMIN_ID, f"🔔 **مستخدم جديد دخل البوت!**\n👤 الاسم: @{username}\n🆔 الآيدي: `{user_id}`", parse_mode="Markdown")
+        except: pass
+    else:
+        db_query("UPDATE users SET username=? WHERE id=?", (username, user_id), commit=True)
+
+def get_level_info(level_id):
+    res = db_query("SELECT * FROM levels WHERE level_id=?", (level_id,), fetch=True)
+    return res[0] if res else (0, "Unknown", 0.0, 999999)
+
+# [جديد] دالة لحساب السعر بناءً على الدولار والدينار
+def get_product_real_price_syr(product_row):
+    """
+    تقوم هذه الدالة بحساب السعر الأساسي بالليرة السورية.
+    إذا كان للمنتج سعر بالدولار > 0، يتم ضربه بسعر الصرف الحالي.
+    وإلا يتم أخذ السعر الثابت بالليرة.
+    """
+    # product_row indices: 0:id, 1:grp, 2:name, 3:price_syr_fixed, 4:api, 5:is_qty, 6:cost, 7:min, 8:price_usd
+    fixed_syr = float(product_row[3])
+    usd_price = 0.0
+    if len(product_row) > 8:
+        usd_price = float(product_row[8]) if product_row[8] else 0.0
+    
+    current_rate = float(get_setting("dollar_rate"))
+    
+    if usd_price > 0:
+        return usd_price * current_rate
+    return fixed_syr
+
+def calculate_final_price(original_syr_price, user_level):
+    """حساب السعر النهائي بعد الخصم (بالليرة)"""
+    lvl = get_level_info(user_level)
+    discount = float(lvl[2])
+    price = original_syr_price - (original_syr_price * discount / 100)
+    return round(price, 3)
+
+def format_price_display(amount_syr, user_pref_currency):
+    """تنسيق عرض السعر (دولار أو ليرة) بناءً على رغبة المستخدم"""
+    if user_pref_currency == 'USD':
+        rate = float(get_setting("dollar_rate"))
+        if rate == 0: rate = 1
+        val_usd = amount_syr / rate
+        return f"{round(val_usd, 2)} $"
+    else:
+        return f"{round(amount_syr, 0)} SYR"
+
+def broadcast_message(text, photo_id=None):
+    users = db_query("SELECT id FROM users", fetch=True)
+    count = 0
+    for user in users:
+        try:
+            if photo_id:
+                bot.send_photo(user[0], photo_id, caption=text)
+            else:
+                bot.send_message(user[0], text)
+            count += 1
+            time.sleep(0.05)
+        except: pass
+    return count
+
+def check_auto_promotion(user_id, total_spent, current_level):
+    levels = db_query("SELECT * FROM levels ORDER BY level_id ASC", fetch=True)
+    eligible_level = current_level
+    for lvl in levels:
+        if total_spent >= lvl[3]:
+            eligible_level = lvl[0]
+    
+    if eligible_level > current_level:
+        db_query("UPDATE users SET level=? WHERE id=?", (eligible_level, user_id), commit=True)
+        new_lvl_info = get_level_info(eligible_level)
+        try:
+            bot.send_message(user_id, f"🎉 **مبروك! تمت ترقيتك تلقائياً!**\n\nأصبحت الآن في المستوى: **{new_lvl_info[1]}**\nتتمتع بخصم: **{new_lvl_info[2]}%** على جميع المنتجات 💎")
+        except: pass
+        return eligible_level
+    return current_level
+
+def get_progress_bar(total_spent, current_level):
+    next_level_id = current_level + 1
+    next_lvl = get_level_info(next_level_id)
+    if next_lvl[1] == "Unknown" or next_level_id > 4:
+        return "🏆 أنت في القمة!", 100
+    target = next_lvl[3]
+    if target == 0: target = 1
+    percent = (total_spent / target) * 100
+    if percent > 100: percent = 100
+    filled = int(percent / 10)
+    bar = "▓" * filled + "░" * (10 - filled)
+    return f"{bar} {int(percent)}%", target - total_spent
+
+# ================= Big Boss API =================
+def execute_big_boss_order(user_id, player_id, api_product_id, quantity=1):
+    if not api_product_id or str(api_product_id) == "0": 
+        return True, "MANUAL_PROCESSING"
+        
+    headers = {'x-api-key': BIG_BOSS_API_TOKEN}
+    payload = {'note': 'true', 'quantity': str(quantity), 'appId': str(player_id), 'productId': str(api_product_id)}
+    
+    files = []
+    with open('temp.txt', 'w') as f: f.write('temp')
+    files = [('image', ('temp.txt', open('temp.txt', 'rb'), 'text/plain'))]
+
+    try:
+        response = requests.post(BIG_BOSS_API_URL, headers=headers, data=payload, files=files)
+        if files: files[0][1][1].close()
+        result = response.json()
+        
+        if response.status_code == 200:
+            inner = result.get("result", {})
+            if isinstance(inner, dict) and inner.get("orderID") and inner.get("status") != "reject":
+                return True, str(inner.get("orderID"))
+            if result.get("message") == "Order created successfully": return True, "تم (بدون ID)"
+            return False, f"فشل: {result}"
+        return False, f"خطأ خادم: {response.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+# ================= القوائم (Menus) =================
+def main_menu(user_id):
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("🛒 المنتجات", callback_data="shop_cats"),
+           types.InlineKeyboardButton("👤 حسابي", callback_data="profile"))
+    mk.add(types.InlineKeyboardButton("🎡 العجلة اليومية", callback_data="daily_raffle_menu"))
+    mk.add(types.InlineKeyboardButton("📥 إيداع رصيد", callback_data="deposit"),
+           types.InlineKeyboardButton("📤 سحب رصيد", callback_data="withdraw"))
+    mk.add(types.InlineKeyboardButton("☎️ الدعم الفني", callback_data="support_view"),
+           types.InlineKeyboardButton("📜 الشروط والاستخدام", callback_data="terms_view"))
+    
+    # [جديد] زر تبديل العملة اذا كان مفعل
+    if get_setting("enable_user_currency") == "1":
+        user_pref = db_query("SELECT currency_pref FROM users WHERE id=?", (user_id,), fetch=True)[0][0]
+        cur_icon = "🇺🇸" if user_pref == "USD" else "🇸🇾"
+        mk.add(types.InlineKeyboardButton(f"💱 العملة: {user_pref} {cur_icon}", callback_data="toggle_currency"))
+
+    if user_id == ADMIN_ID:
+        mk.add(types.InlineKeyboardButton("🔐 لوحة الإدارة", callback_data="admin_panel"))
+    return mk
+
+def admin_menu():
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(types.InlineKeyboardButton("📋 الطلبات الإضافية (المعلقة)", callback_data="adm_manual_orders"))
+    mk.add(types.InlineKeyboardButton("💰 إدارة أرباحي", callback_data="adm_profits"))
+    mk.add(types.InlineKeyboardButton("📊 الإحصائيات العامة", callback_data="adm_stats"))
+    mk.add(types.InlineKeyboardButton("📦 المنتجات", callback_data="adm_products"),
+           types.InlineKeyboardButton("👥 إدارة المستخدمين", callback_data="adm_users"))
+    mk.add(types.InlineKeyboardButton("🏅 تغيير مستوى (سريع)", callback_data="adm_quick_level"),
+           types.InlineKeyboardButton("💰 إدارة الأرصدة", callback_data="adm_manage_balance"))
+    mk.add(types.InlineKeyboardButton("🎡 إدارة السحب", callback_data="adm_raffle_manage"),
+           types.InlineKeyboardButton("💸 طلبات مالية", callback_data="adm_transactions"))
+    mk.add(types.InlineKeyboardButton("💳 طرق الدفع", callback_data="adm_methods"),
+           types.InlineKeyboardButton("✏️ النصوص", callback_data="adm_texts"))
+    mk.add(types.InlineKeyboardButton("💎 إعدادات المستويات", callback_data="adm_levels"),
+           types.InlineKeyboardButton("📢 إشعار للكل", callback_data="adm_broadcast"))
+    mk.add(types.InlineKeyboardButton("🎛 تفعيل/تعطيل المجموعات", callback_data="adm_grp_status"))
+    
+    # [جديد] أزرار التحكم بالميزات الجديدة
+    mk.add(types.InlineKeyboardButton("💲 سعر الصرف", callback_data="adm_set_rate"),
+           types.InlineKeyboardButton("🔘 زر الوسيط", callback_data="adm_toggle_mediator"))
+    mk.add(types.InlineKeyboardButton("💱 عملة الزبائن", callback_data="adm_toggle_user_cur"),
+           types.InlineKeyboardButton("☁️ رفع للسيرفر", callback_data="adm_server_help"))
+
+    mk.add(types.InlineKeyboardButton("🛑 وضع الصيانة", callback_data="adm_maintenance"),
+           types.InlineKeyboardButton("🔙 خروج", callback_data="home"))
+    return mk
+
+# ================= الأوامر =================
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    uid = message.from_user.id
+    register_user(uid, message.from_user.username)
+    
+    maint = get_setting("maintenance")
+    if maint == "1" and uid != ADMIN_ID:
+        bot.send_message(uid, "⚠️ **البوت حالياً في وضع الصيانة.**\nنعمل على تحديثات جديدة، سنعود قريباً!", parse_mode="Markdown")
+        return
+
+    if CHANNEL_USERNAME:
+        try:
+            stat = bot.get_chat_member(f"@{CHANNEL_USERNAME}", uid).status
+            if stat in ['left', 'kicked']:
+                mk = types.InlineKeyboardMarkup()
+                mk.add(types.InlineKeyboardButton("اشتراك بالقناة", url=f"t.me/{CHANNEL_USERNAME}"))
+                mk.add(types.InlineKeyboardButton("تحقق ✅", callback_data="home"))
+                bot.send_message(uid, "⚠️ يرجى الاشتراك في القناة أولاً.", reply_markup=mk)
+                return
+        except: pass
+        
+    welcome_text = get_setting("start_msg")
+    bot.send_message(uid, welcome_text, reply_markup=main_menu(uid))
+
+# ================= Callbacks =================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    uid = call.from_user.id
+    data = call.data
+    user_data = get_user(uid)
+
+    if data.startswith("do_set_lvl_"):
+        if uid != ADMIN_ID: return
+        parts = data.split("_")
+        target_id = int(parts[3])
+        target_lvl = int(parts[4])
+        
+        db_query("UPDATE users SET level=? WHERE id=?", (target_lvl, target_id), commit=True)
+        lvl_name = get_level_info(target_lvl)[1]
+        
+        bot.answer_callback_query(call.id, "✅ تم التغيير بنجاح")
+        bot.edit_message_text(f"✅ **تم تغيير المستوى!**\n\nالمستخدم: `{target_id}`\nالمستوى الجديد: **{lvl_name}**", uid, call.message.message_id, parse_mode="Markdown")
+        try:
+            bot.send_message(target_id, f"🎉 **تنبيه إداري!** 🎉\n\nتم تغيير مستواك يدوياً من قبل الإدارة!\nأصبحت الآن في المستوى: **{lvl_name}** 💎", parse_mode="Markdown")
+        except: pass
+        return 
+
+    maint = get_setting("maintenance")
+    if maint == "1" and uid != ADMIN_ID:
+        bot.answer_callback_query(call.id, "البوت في وضع الصيانة", show_alert=True)
+        return
+
+    if data == "home":
+        bot.edit_message_text(get_setting("start_msg"), uid, call.message.message_id, reply_markup=main_menu(uid))
+    
+    # [جديد] تبديل العملة
+    elif data == "toggle_currency":
+        curr = user_data[7] if len(user_data) > 7 else "SYR" # Assuming idx 7 is currency
+        new_curr = "USD" if curr == "SYR" else "SYR"
+        db_query("UPDATE users SET currency_pref=? WHERE id=?", (new_curr, uid), commit=True)
+        bot.answer_callback_query(call.id, f"تم التبديل إلى {new_curr}")
+        bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=main_menu(uid))
+
+    elif data == "profile":
+        lvl = get_level_info(user_data[3])
+        bar, remaining = get_progress_bar(user_data[4], user_data[3])
+        rem_txt = f"\n🎯 باقي للمستوى التالي: {remaining} SYR" if isinstance(remaining, (int, float)) else ""
+        
+        # عرض الرصيد حسب التفضيل
+        user_pref = user_data[7] if len(user_data) > 7 else "SYR"
+        balance_display = format_price_display(user_data[2], user_pref)
+        spent_display = format_price_display(user_data[4], user_pref)
+
+        txt = (f"👤 **حسابي الشخصي**\n"
+               f"🆔 الآيدي: `{uid}`\n"
+               f"💰 الرصيد: **{balance_display}**\n"
+               f"💸 إجمالي الإنفاق: {spent_display}\n"
+               f"➖➖➖➖➖➖➖➖\n"
+               f"⭐ المستوى: **{lvl[1]}**\n"
+               f"📉 نسبة الخصم: **{lvl[2]}%**\n"
+               f"📊 التقدم: {bar}{rem_txt}")
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="home"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    # --- نظام السحب (العجلة اليومية) ---
+    elif data == "daily_raffle_menu":
+        fee = int(get_setting("raffle_fee"))
+        prize = int(get_setting("raffle_prize"))
+        existing = db_query("SELECT * FROM raffle_entries WHERE user_id=?", (uid,), fetch=True)
+        
+        txt = f"🎡 **العجلة اليومية والسحب الكبير!**\n\n" \
+              f"💰 **تكلفة الدخول:** {fee} SYR\n" \
+              f"🏆 **الجائزة الكبرى:** {prize} SYR\n\n" \
+              f"💡 كيف تعمل؟\n" \
+              f"ادفع الاشتراك مرة واحدة للدخول في القائمة. يتم اختيار الفائز عشوائياً عند اكتمال العدد.\n"
+        
+        mk = types.InlineKeyboardMarkup()
+        if existing:
+            txt += "\n✅ **أنت مشترك بالفعل في السحب الحالي.**\nانتظر إعلان الفائز!"
+        else:
+            mk.add(types.InlineKeyboardButton(f"🎟 اشترك الآن ({fee} SYR)", callback_data="join_raffle_confirm"))
+        
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="home"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    elif data == "join_raffle_confirm":
+        fee = int(get_setting("raffle_fee"))
+        if user_data[2] < fee:
+            bot.answer_callback_query(call.id, "🚫 رصيدك غير كافٍ للاشتراك!", show_alert=True)
+            return
+
+        db_query("UPDATE users SET balance = balance - ? WHERE id=?", (fee, uid), commit=True)
+        db_query("INSERT OR IGNORE INTO raffle_entries (user_id, join_date) VALUES (?, ?)", (uid, int(time.time())), commit=True)
+        
+        bot.answer_callback_query(call.id, "🎉 تم الاشتراك بنجاح!", show_alert=True)
+        bot.edit_message_text("✅ **تم دخول السحب بنجاح!**\n\nحظاً موفقاً! سيتم اختيار الفائز قريباً.", uid, call.message.message_id, parse_mode="Markdown", reply_markup=main_menu(uid))
+
+    elif data == "support_view":
+        bot.edit_message_text(get_setting("support_msg"), uid, call.message.message_id, parse_mode="Markdown", 
+                              reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 رجوع", callback_data="home")))
+
+    elif data == "terms_view":
+        bot.edit_message_text(get_setting("terms_msg"), uid, call.message.message_id, parse_mode="Markdown", 
+                              reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🔙 رجوع", callback_data="home")))
+
+    # --- المتجر ---
+    elif data == "shop_cats":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for c in cats: mk.add(types.InlineKeyboardButton(f"{c[1]}", callback_data=f"cat_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="home"))
+        bot.edit_message_text("🛒 الأقسام:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("cat_"):
+        cid = int(data.split("_")[1])
+        groups = db_query("SELECT * FROM groups WHERE category_id=?", (cid,), fetch=True)
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        
+        for g in groups:
+            is_active = g[4] if len(g) > 4 else 1 
+            grp_name = g[2]
+            
+            if is_active == 1:
+                mk.add(types.InlineKeyboardButton(f"{grp_name}", callback_data=f"grp_{g[0]}"))
+            else:
+                mk.add(types.InlineKeyboardButton(f"⚫ {grp_name} (غير متوفر)", callback_data=f"disabled_grp_{g[0]}"))
+
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="shop_cats"))
+        bot.edit_message_text("اختر المجموعة:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("disabled_grp_"):
+        bot.answer_callback_query(call.id, "⛔ هذه المجموعة غير متوفرة حالياً!", show_alert=True)
+
+    elif data.startswith("grp_"):
+        gid = int(data.split("_")[1])
+        
+        # [جديد] التحقق من تفعيل الوسيط
+        enable_mediator = get_setting("enable_mediator") == "1"
+        if enable_mediator:
+            # إذا كان الوسيط مفعلاً، ننتقل لقائمة الوسطاء
+            mediators = db_query("SELECT * FROM mediators WHERE group_id=?", (gid,), fetch=True)
+            mk = types.InlineKeyboardMarkup(row_width=2)
+            # زر عرض الكل (للمنتجات التي ليس لها وسيط)
+            mk.add(types.InlineKeyboardButton("📂 عام / الكل", callback_data=f"med_0_{gid}"))
+            for m in mediators:
+                mk.add(types.InlineKeyboardButton(f"🔹 {m[2]}", callback_data=f"med_{m[0]}_{gid}"))
+            
+            try:
+                parent_cat = db_query('SELECT category_id FROM groups WHERE id=?', (gid,), fetch=True)[0][0]
+                mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data=f"cat_{parent_cat}"))
+            except: pass
+            
+            bot.edit_message_text("اختر القسم الفرعي:", uid, call.message.message_id, reply_markup=mk)
+        else:
+            # إذا الوسيط معطل، نذهب مباشرة للمنتجات (مع تمرير mediator_id=0 ليعني الكل)
+            handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': f'med_all_{gid}', 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("med_"):
+        # med_MediatorID_GroupID  OR med_all_GroupID
+        parts = data.split("_")
+        med_id = parts[1] # يمكن أن يكون "all" أو رقم
+        gid = int(parts[2])
+        
+        query = "SELECT * FROM products WHERE group_id=?"
+        args = [gid]
+        
+        # إذا كان id محدد (ليس all وليس 0 لعرض الكل) يمكن تخصيص الفلترة هنا
+        # لكن للتبسيط، إذا اخترنا وسيط، نعرض المنتجات التابعة له. 
+        # ملاحظة: في كود المنتجات القديم لم يكن هناك mediator_id، لذلك المنتجات القديمة ستظهر في "عام" إذا أضفنا شرط
+        if med_id != "all" and med_id != "0":
+             query += " AND mediator_id=?"
+             args.append(int(med_id))
+        elif med_id == "0":
+             # المنتجات العامة فقط
+             query += " AND (mediator_id IS NULL OR mediator_id=0)"
+
+        prods = db_query(query, tuple(args), fetch=True)
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        
+        user_pref = user_data[7] if len(user_data) > 7 else "SYR"
+
+        for p in prods:
+            is_qty_prod = (len(p) > 5 and p[5] == 1)
+            
+            # [جديد] حساب السعر الحقيقي (دولار أو ليرة)
+            real_base_price = get_product_real_price_syr(p)
+            
+            if is_qty_prod:
+                # للمنتجات بالكمية، السعر هو سعر الحبة الواحدة
+                # لا نطبق خصم المستوى على سعر الوحدة هنا للعرض فقط، أو نطبقه حسب الرغبة.
+                # سنعرض سعر الوحدة الصافي.
+                price_display = format_price_display(real_base_price, user_pref)
+                price_txt = f"{price_display} (للحبة)"
+            else:
+                final_syr = calculate_final_price(real_base_price, user_data[3])
+                price_display = format_price_display(final_syr, user_pref)
+                price_txt = f"{price_display}"
+        
+            mk.add(types.InlineKeyboardButton(f"{p[2]} | {price_txt}", callback_data=f"buy_{p[0]}"))
+        
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data=f"grp_{gid}" if get_setting("enable_mediator")=="1" else f"cat_{db_query('SELECT category_id FROM groups WHERE id=?', (gid,), fetch=True)[0][0]}"))
+
+        grp_img = db_query("SELECT image_url FROM groups WHERE id=?", (gid,), fetch=True)[0][0]
+        caption = "👇 اختر الباقة:"
+        if grp_img:
+            try:
+                bot.send_photo(uid, grp_img, caption=caption, reply_markup=mk)
+                bot.delete_message(uid, call.message.message_id)
+            except: bot.edit_message_text(caption, uid, call.message.message_id, reply_markup=mk)
+        else: bot.edit_message_text(caption, uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("buy_"):
+        pid = int(data.split("_")[1])
+        prod = db_query("SELECT * FROM products WHERE id=?", (pid,), fetch=True)[0]
+        
+        is_qty_prod = (len(prod) > 5 and prod[5] == 1)
+        
+        # [جديد] حساب السعر الأساسي الحقيقي
+        real_base_price_syr = get_product_real_price_syr(prod)
+        user_pref = user_data[7] if len(user_data) > 7 else "SYR"
+
+        if is_qty_prod:
+            min_qty = prod[7] if len(prod) > 7 else 1
+            unit_price_disp = format_price_display(real_base_price_syr, user_pref)
+            
+            msg_text = (f"📝 **طلب كميات: {prod[2]}**\n"
+                        f"💰 سعر الحبة: **{unit_price_disp}**\n"
+                        f"🔢 أقل كمية: **{min_qty}**\n\n"
+                        f"👇 **أرسل الكمية المطلوبة الآن (أرقام فقط):**\n"
+                        f"سيقوم البوت بحساب السعر الإجمالي تلقائياً.")
+            bot.send_message(uid, msg_text, parse_mode="Markdown")
+            admin_states[uid] = {"action": "wait_qty_input", "prod_id": pid, "min_qty": min_qty}
+        else:
+            final_price = calculate_final_price(real_base_price_syr, user_data[3])
+            price_disp = format_price_display(final_price, user_pref)
+            
+            if user_data[2] < final_price:
+                bot.answer_callback_query(call.id, "🚫 رصيدك غير كاف!", show_alert=True)
+                return
+
+            is_manual = (prod[4] == "0" or not prod[4])
+            type_txt = "(تسليم يدوي 🛠️)" if is_manual else "(تسليم فوري ⚡)"
+            
+            msg = bot.send_message(uid, f"📝 شراء: {prod[2]}\n{type_txt}\n💰 السعر: {price_disp}\n\n🆔 **أرسل الآيدي (ID) الآن:**")
+            admin_states[uid] = {"action": "wait_player_id", "prod_id": pid, "price": final_price, "is_manual": is_manual}
+
+    # --- الإيداع والسحب ---
+    elif data == "deposit":
+        methods = db_query("SELECT * FROM payment_methods", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        if not methods:
+            bot.answer_callback_query(call.id, "لا توجد طرق دفع متاحة حالياً", show_alert=True)
+            return
+        for m in methods:
+            mk.add(types.InlineKeyboardButton(f"📥 {m[1]}", callback_data=f"dep_meth_{m[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 إلغاء", callback_data="home"))
+        bot.edit_message_text("💳 اختر طريقة الإيداع:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("dep_meth_"):
+        mid = int(data.split("_")[2])
+        meth = db_query("SELECT * FROM payment_methods WHERE id=?", (mid,), fetch=True)[0]
+        info = f"💳 **إيداع عبر {meth[1]}**\n\n🔢 الرقم: `{meth[2]}`\n📝 التعليمات: {meth[3]}\n\n👇 **أرسل المبلغ الذي قمت بتحويله (أرقام فقط):**"
+        bot.edit_message_text(info, uid, call.message.message_id, parse_mode="Markdown")
+        admin_states[uid] = {"action": "dep_wait_amount", "method_name": meth[1]}
+
+    elif data == "withdraw":
+        methods = db_query("SELECT * FROM payment_methods", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        if not methods:
+            bot.answer_callback_query(call.id, "لا توجد طرق سحب متاحة", show_alert=True)
+            return
+        for m in methods:
+            mk.add(types.InlineKeyboardButton(f"📤 {m[1]}", callback_data=f"wd_meth_{m[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 إلغاء", callback_data="home"))
+        bot.edit_message_text("💳 اختر طريقة السحب:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("wd_meth_"):
+        mid = int(data.split("_")[2])
+        meth = db_query("SELECT * FROM payment_methods WHERE id=?", (mid,), fetch=True)[0]
+        bot.edit_message_text(f"📤 سحب عبر {meth[1]}\n⚠️ عمولة السحب: {WITHDRAW_FEE_PERCENT}%\n\n👇 **أرسل المبلغ المراد سحبه:**", uid, call.message.message_id)
+        admin_states[uid] = {"action": "wd_wait_amount", "method_name": meth[1]}
+
+    # ================= لوحة الإدارة =================
+    elif data == "admin_panel":
+        if uid == ADMIN_ID: bot.edit_message_text("🛠 لوحة الأدمن:", uid, call.message.message_id, reply_markup=admin_menu())
+
+    # [ميزة جديدة] إدارة الأرباح
+    elif data == "adm_profits":
+        if uid != ADMIN_ID: return
+        today = datetime.date.today()
+        first_day = today.replace(day=1)
+        start_of_month_ts = time.mktime(first_day.timetuple())
+        
+        m_stats = db_query("SELECT SUM(price_paid), SUM(cost_at_purchase) FROM orders WHERE status IN ('completed', 'completed_manual') AND created_at >= ?", (start_of_month_ts,), fetch=True)[0]
+        m_rev = m_stats[0] or 0
+        m_cost = m_stats[1] or 0
+        m_prof = m_rev - m_cost
+        
+        a_stats = db_query("SELECT SUM(price_paid), SUM(cost_at_purchase) FROM orders WHERE status IN ('completed', 'completed_manual')", fetch=True)[0]
+        a_rev = a_stats[0] or 0
+        a_cost = a_stats[1] or 0
+        a_prof = a_rev - a_cost
+        
+        txt = (f"💰 **تقرير الأرباح**\n\n"
+               f"📅 **هذا الشهر:**\n📥 مبيعات: {round(m_rev, 2)}\n📤 تكلفة: {round(m_cost, 2)}\n✅ **صافي: {round(m_prof, 2)}**\n\n"
+               f"📂 **الكل:**\n📥 مبيعات: {round(a_rev, 2)}\n📤 تكلفة: {round(a_cost, 2)}\n✅ **صافي: {round(a_prof, 2)}**")
+        
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🔄 تحديث", callback_data="adm_profits"), types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    # [ميزة جديدة] قائمة الطلبات المعلقة (الإضافية)
+    elif data == "adm_manual_orders":
+        if uid != ADMIN_ID: return
+        orders = db_query("SELECT * FROM orders WHERE status='pending_manual' ORDER BY created_at ASC", fetch=True)
+        if not orders:
+            bot.answer_callback_query(call.id, "لا توجد طلبات معلقة!", show_alert=True)
+            return
+        
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for o in orders:
+            u_name = get_user(o[1])[1]
+            mk.add(types.InlineKeyboardButton(f"#{o[0]} | {u_name} | {o[2]}", callback_data=f"man_ord_view_{o[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(f"📋 الطلبات المعلقة ({len(orders)}):", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("man_ord_view_"):
+        oid = data.split("_")[3]
+        o = db_query("SELECT * FROM orders WHERE order_id=?", (oid,), fetch=True)
+        if not o: return
+        o = o[0]
+        qty_info = f" (x{o[7]})" if len(o) > 7 and o[7] > 1 else ""
+        txt = f"📝 **طلب #{o[0]}**\n👤 ID: `{o[1]}`\n📦 المنتج: {o[2]}{qty_info}\n💰 السعر: {o[3]}\n⚠️ الحالة: انتظار"
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("✅ قبول (تم التنفيذ)", callback_data=f"man_act_ok_{oid}"))
+        mk.add(types.InlineKeyboardButton("❌ رفض (استرجاع)", callback_data=f"man_act_no_{oid}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_manual_orders"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    elif data.startswith("man_act_ok_"):
+        oid = data.split("_")[3]
+        db_query("UPDATE orders SET status='completed_manual' WHERE order_id=?", (oid,), commit=True)
+        o = db_query("SELECT user_id FROM orders WHERE order_id=?", (oid,), fetch=True)[0]
+        try: bot.send_message(o[0], f"✅ **تم تنفيذ طلبك #{oid} بنجاح!**")
+        except: pass
+        bot.answer_callback_query(call.id, "تم القبول")
+        handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': 'adm_manual_orders', 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("man_act_no_"):
+        oid = data.split("_")[3]
+        bot.send_message(uid, "📝 أرسل سبب الرفض (سيتم إرساله للمستخدم):")
+        admin_states[uid] = {"action": "reject_manual_reason", "oid": oid}
+
+    # --- إدارة حالة المجموعات ---
+    elif data == "adm_grp_status":
+        if uid != ADMIN_ID: return
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats:
+            mk.add(types.InlineKeyboardButton(f"📂 {c[1]}", callback_data=f"adm_list_grps_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("اختر القسم لعرض المجموعات وتغيير حالتها:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("adm_list_grps_"):
+        cid = int(data.split("_")[3])
+        grps = db_query("SELECT * FROM groups WHERE category_id=?", (cid,), fetch=True)
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for g in grps:
+            active = g[4] if len(g) > 4 else 1
+            status_icon = "✅" if active == 1 else "🔴"
+            mk.add(types.InlineKeyboardButton(f"{status_icon} {g[2]}", callback_data=f"toggle_grp_{g[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_grp_status"))
+        bot.edit_message_text("اضغط على المجموعة لتعطيلها/تفعيلها:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("toggle_grp_"):
+        gid = int(data.split("_")[2])
+        curr = db_query("SELECT is_active, category_id FROM groups WHERE id=?", (gid,), fetch=True)[0]
+        new_val = 0 if curr[0] == 1 else 1
+        db_query("UPDATE groups SET is_active=? WHERE id=?", (new_val, gid), commit=True)
+        bot.answer_callback_query(call.id, "تم تغيير الحالة")
+        handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': f'adm_list_grps_{curr[1]}', 'message': call.message, 'id': call.id}))
+
+    # --- الإحصائيات ---
+    elif data == "adm_stats":
+        if uid != ADMIN_ID: return
+        total_users = db_query("SELECT COUNT(*) FROM users", fetch=True)[0][0]
+        total_spent = db_query("SELECT SUM(total_spent) FROM users", fetch=True)[0][0] or 0
+        total_orders = db_query("SELECT COUNT(*) FROM orders", fetch=True)[0][0]
+        dollar_rate = get_setting("dollar_rate")
+        txt = f"📊 **إحصائيات البوت العامة**\n\n👥 عدد المستخدمين: **{total_users}**\n💰 إجمالي المبيعات: **{total_spent} SYR**\n📦 إجمالي الطلبات: **{total_orders}**\n💲 سعر الصرف الحالي: **{dollar_rate}**"
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("👥 عرض قائمة المستخدمين", callback_data="adm_browse_users_0"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    elif data.startswith("adm_browse_users_"):
+        if uid != ADMIN_ID: return
+        page = int(data.split("_")[3])
+        limit = 10
+        offset = page * limit
+        users = db_query(f"SELECT id, username, balance FROM users LIMIT {limit} OFFSET {offset}", fetch=True)
+        total_users_count = db_query("SELECT COUNT(*) FROM users", fetch=True)[0][0]
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        for u in users:
+            name = u[1] if u[1] else "No Name"
+            mk.add(types.InlineKeyboardButton(f"{name} | {u[2]}", callback_data=f"adm_user_info_{u[0]}"))
+        nav_btns = []
+        if page > 0: nav_btns.append(types.InlineKeyboardButton("⬅️ السابق", callback_data=f"adm_browse_users_{page-1}"))
+        if (offset + limit) < total_users_count: nav_btns.append(types.InlineKeyboardButton("التالي ➡️", callback_data=f"adm_browse_users_{page+1}"))
+        if nav_btns: mk.add(*nav_btns)
+        mk.add(types.InlineKeyboardButton("🔙 رجوع للإحصائيات", callback_data="adm_stats"))
+        bot.edit_message_text(f"👥 قائمة المستخدمين (صفحة {page+1}):", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("adm_user_info_"):
+        if uid != ADMIN_ID: return
+        tgt_id = int(data.split("_")[3])
+        u = get_user(tgt_id)
+        if not u: return
+        last_orders = db_query("SELECT product_name, price_paid, date(created_at, 'unixepoch') FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT 5", (tgt_id,), fetch=True)
+        orders_txt = "\n📦 **آخر المشتريات:**\n"
+        if not last_orders: orders_txt += "لا يوجد طلبات.\n"
+        for o in last_orders: orders_txt += f"- {o[0]} ({o[1]} SYR)\n"
+        info = f"👤 **معلومات المستخدم**\n\n🆔 ID: `{u[0]}`\n📛 Username: @{u[1]}\n💰 الرصيد الحالي: **{u[2]}**\n💸 إجمالي الإنفاق: **{u[4]}**\n⭐ المستوى: {u[3]}\n📅 الانضمام: {time.ctime(u[6])}\n----------------\n{orders_txt}"
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="adm_browse_users_0"))
+        bot.edit_message_text(info, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    # --- إدارة السحب/العجلة ---
+    elif data == "adm_raffle_manage":
+        if uid != ADMIN_ID: return
+        count = db_query("SELECT COUNT(*) FROM raffle_entries", fetch=True)[0][0]
+        fee = get_setting("raffle_fee")
+        prize = get_setting("raffle_prize")
+        txt = f"🎡 **إدارة السحب والعجلة**\n\n👥 المشتركين حالياً: **{count}**\n💰 سعر الدخول: **{fee}**\n🏆 قيمة الجائزة: **{prize}**"
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🎲 سحب الفائز الآن", callback_data="adm_raffle_draw"))
+        mk.add(types.InlineKeyboardButton("✏️ تغيير السعر", callback_data="adm_set_raf_fee"),
+               types.InlineKeyboardButton("✏️ تغيير الجائزة", callback_data="adm_set_raf_prize"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+
+    elif data == "adm_raffle_draw":
+        entries = db_query("SELECT user_id FROM raffle_entries", fetch=True)
+        count = len(entries)
+        min_users = int(get_setting("raffle_min_users"))
+        if count == 0:
+            bot.answer_callback_query(call.id, "🚫 لا يوجد مشتركين!", show_alert=True)
+            return
+        if count < min_users:
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton("نعم، تابع السحب", callback_data="adm_force_draw"),
+                   types.InlineKeyboardButton("إلغاء", callback_data="adm_raffle_manage"))
+            bot.edit_message_text(f"⚠️ العدد الحالي ({count}) أقل من الحد الأدنى ({min_users}).\nهل تريد المتابعة والسحب؟", uid, call.message.message_id, reply_markup=mk)
+            return
+        handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': 'adm_force_draw', 'message': call.message, 'id': call.id}))
+
+    elif data == "adm_force_draw":
+        entries = db_query("SELECT user_id FROM raffle_entries", fetch=True)
+        if not entries: return
+        winner_id = random.choice(entries)[0]
+        prize = int(get_setting("raffle_prize"))
+        db_query("UPDATE users SET balance = balance + ? WHERE id=?", (prize, winner_id), commit=True)
+        db_query("DELETE FROM raffle_entries", commit=True)
+        try: bot.send_message(winner_id, f"🎉🎉 **ألف مبروك!** 🎉🎉\n\nلقد ربحت في السحب اليومي!\nتم إضافة **{prize} SYR** إلى رصيدك.", parse_mode="Markdown")
+        except: pass
+        bot.answer_callback_query(call.id, "تم السحب بنجاح!")
+        bot.edit_message_text(f"✅ **تم السحب!**\n\nالفائز: `{winner_id}`\nالجائزة: {prize}\nتم تصفير القائمة.", uid, call.message.message_id, parse_mode="Markdown", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("رجوع", callback_data="adm_raffle_manage")))
+
+    elif data == "adm_set_raf_fee":
+        bot.send_message(uid, "أرسل سعر الاشتراك الجديد:")
+        admin_states[uid] = {"action": "set_raf_fee"}
+    elif data == "adm_set_raf_prize":
+        bot.send_message(uid, "أرسل قيمة الجائزة الجديدة:")
+        admin_states[uid] = {"action": "set_raf_prize"}
+
+    # --- إدارة المنتجات ---
+    elif data == "adm_products":
+        if uid != ADMIN_ID: return
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ إضافة (تصنيف/مجموعة/منتج)", callback_data="adm_add_menu"))
+        mk.add(types.InlineKeyboardButton("🗑 حذف (تصنيف/مجموعة/منتج)", callback_data="adm_del_menu"))
+        mk.add(types.InlineKeyboardButton("✏️ تعديل (تصنيف/مجموعة/منتج)", callback_data="adm_edit_menu"))
+        
+        # [جديد] زر إدارة الوسيط
+        if get_setting("enable_mediator") == "1":
+            mk.add(types.InlineKeyboardButton("🔷 إضافة/حذف وسيط", callback_data="adm_med_menu"))
+            
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("📦 إدارة المنتجات الشاملة:", uid, call.message.message_id, reply_markup=mk)
+
+    # [جديد] قائمة الوسيط
+    elif data == "adm_med_menu":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ إضافة وسيط لمجموعة", callback_data="adm_add_med"))
+        mk.add(types.InlineKeyboardButton("🗑 حذف وسيط", callback_data="adm_del_med"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_products"))
+        bot.edit_message_text("إدارة الوسطاء:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data == "adm_add_med":
+        grps = db_query("SELECT * FROM groups", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(g[2], callback_data=f"sel_grp_med_{g[0]}"))
+        bot.edit_message_text("اختر المجموعة لإضافة وسيط لها:", uid, call.message.message_id, reply_markup=mk)
+        
+    elif data.startswith("sel_grp_med_"):
+        gid = int(data.split("_")[3])
+        bot.send_message(uid, "أرسل اسم الوسيط (القسم الفرعي):")
+        admin_states[uid] = {"action": "add_med_name", "gid": gid}
+
+    elif data == "adm_del_med":
+        # عرض الوسطاء للحذف
+        meds = db_query("SELECT * FROM mediators", fetch=True)
+        mk = types.InlineKeyboardMarkup(row_width=1)
+        for m in meds: mk.add(types.InlineKeyboardButton(f"❌ {m[2]} (ID: {m[0]})", callback_data=f"exec_del_med_{m[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_med_menu"))
+        bot.edit_message_text("اختر الوسيط لحذفه:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data.startswith("exec_del_med_"):
+        mid = int(data.split("_")[3])
+        db_query("DELETE FROM mediators WHERE id=?", (mid,), commit=True)
+        # تصفير المنتج المرتبط
+        db_query("UPDATE products SET mediator_id=0 WHERE mediator_id=?", (mid,), commit=True)
+        bot.answer_callback_query(call.id, "تم الحذف")
+        handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': 'adm_del_med', 'message': call.message, 'id': call.id}))
+
+    elif data == "adm_add_menu":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ تصنيف", callback_data="adm_add_cat"), types.InlineKeyboardButton("➕ مجموعة", callback_data="adm_add_grp"), types.InlineKeyboardButton("➕ منتج", callback_data="adm_add_prod"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_products"))
+        bot.edit_message_text("إضافة:", uid, call.message.message_id, reply_markup=mk)
+    elif data == "adm_del_menu":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🗑 تصنيف", callback_data="adm_del_cat_list"), types.InlineKeyboardButton("🗑 مجموعة", callback_data="adm_del_grp_list"), types.InlineKeyboardButton("🗑 منتج", callback_data="adm_del_prod_list"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_products"))
+        bot.edit_message_text("حذف:", uid, call.message.message_id, reply_markup=mk)
+    elif data == "adm_edit_menu":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("✏️ تصنيف", callback_data="adm_edit_cat_list"), types.InlineKeyboardButton("✏️ مجموعة", callback_data="adm_edit_grp_list"), types.InlineKeyboardButton("✏️ منتج", callback_data="adm_edit_prod_list"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_products"))
+        bot.edit_message_text("تعديل:", uid, call.message.message_id, reply_markup=mk)
+
+    # إضافة منتج (مع التعديلات الجديدة)
+    elif data == "adm_add_cat":
+        bot.send_message(uid, "أرسل اسم التصنيف:")
+        admin_states[uid] = {"action": "add_cat"}
+    elif data == "adm_add_grp":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats: mk.add(types.InlineKeyboardButton(c[1], callback_data=f"sel_cat_grp_{c[0]}"))
+        bot.edit_message_text("اختر التصنيف:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("sel_cat_grp_"):
+        bot.send_message(uid, "اسم المجموعة:")
+        admin_states[uid] = {"action": "add_grp_name", "cid": int(data.split("_")[3])}
+    
+    elif data == "adm_add_prod":
+        grps = db_query("SELECT * FROM groups", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(g[2], callback_data=f"sel_grp_prod_{g[0]}"))
+        bot.edit_message_text("اختر المجموعة:", uid, call.message.message_id, reply_markup=mk)
+    
+    elif data.startswith("sel_grp_prod_"):
+        gid = int(data.split("_")[3])
+        # [جديد] إذا الوسيط مفعل، نسأل عن الوسيط أولاً
+        if get_setting("enable_mediator") == "1":
+            meds = db_query("SELECT * FROM mediators WHERE group_id=?", (gid,), fetch=True)
+            if meds:
+                mk = types.InlineKeyboardMarkup()
+                mk.add(types.InlineKeyboardButton("بدون وسيط", callback_data=f"sel_med_prod_0_{gid}"))
+                for m in meds: mk.add(types.InlineKeyboardButton(m[2], callback_data=f"sel_med_prod_{m[0]}_{gid}"))
+                bot.edit_message_text("اختر الوسيط (القسم الفرعي):", uid, call.message.message_id, reply_markup=mk)
+                return
+        # إذا لم يكن هناك وسطاء أو الميزة معطلة
+        handle_callback(type('obj', (object,), {'from_user': call.from_user, 'data': f'sel_med_prod_0_{gid}', 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("sel_med_prod_"):
+        parts = data.split("_")
+        med_id = int(parts[3])
+        gid = int(parts[4])
+        
+        bot.send_message(uid, "اسم المنتج:")
+        admin_states[uid] = {"action": "add_prod_name", "gid": gid, "med_id": med_id}
+    
+    # بقية الحذف والتعديل
+    elif data == "adm_del_cat_list":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats: mk.add(types.InlineKeyboardButton(f"❌ {c[1]}", callback_data=f"exec_del_cat_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_del_menu"))
+        bot.edit_message_text("حذف تصنيف:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("exec_del_cat_"):
+        cid = int(data.split("_")[3])
+        grps = db_query("SELECT id FROM groups WHERE category_id=?", (cid,), fetch=True)
+        for g in grps: db_query("DELETE FROM products WHERE group_id=?", (g[0],), commit=True)
+        db_query("DELETE FROM groups WHERE category_id=?", (cid,), commit=True)
+        db_query("DELETE FROM categories WHERE id=?", (cid,), commit=True)
+        bot.answer_callback_query(call.id, "تم الحذف")
+        handle_callback(call)
+    elif data == "adm_del_grp_list":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats: mk.add(types.InlineKeyboardButton(f"📂 {c[1]}", callback_data=f"list_del_grp_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_del_menu"))
+        bot.edit_message_text("اختر التصنيف:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("list_del_grp_"):
+        cid = int(data.split("_")[3])
+        grps = db_query("SELECT * FROM groups WHERE category_id=?", (cid,), fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(f"❌ {g[2]}", callback_data=f"exec_del_grp_{g[0]}"))
+        bot.edit_message_text("حذف مجموعة:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("exec_del_grp_"):
+        gid = int(data.split("_")[3])
+        db_query("DELETE FROM products WHERE group_id=?", (gid,), commit=True)
+        db_query("DELETE FROM groups WHERE id=?", (gid,), commit=True)
+        bot.answer_callback_query(call.id, "تم الحذف")
+        bot.edit_message_text("تم الحذف", uid, call.message.message_id, reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("رجوع", callback_data="adm_products")))
+    elif data == "adm_del_prod_list":
+        grps = db_query("SELECT * FROM groups", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(f"🎮 {g[2]}", callback_data=f"list_del_prod_{g[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_del_menu"))
+        bot.edit_message_text("اختر المجموعة:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("list_del_prod_"):
+        gid = int(data.split("_")[3])
+        prods = db_query("SELECT * FROM products WHERE group_id=?", (gid,), fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for p in prods: mk.add(types.InlineKeyboardButton(f"❌ {p[2]}", callback_data=f"exec_del_prod_{p[0]}"))
+        bot.edit_message_text("حذف منتج:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("exec_del_prod_"):
+        pid = int(data.split("_")[3])
+        db_query("DELETE FROM products WHERE id=?", (pid,), commit=True)
+        bot.answer_callback_query(call.id, "تم الحذف")
+        bot.edit_message_text("تم الحذف", uid, call.message.message_id, reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("رجوع", callback_data="adm_products")))
+
+    # Edit Handlers
+    elif data == "adm_edit_cat_list":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats: mk.add(types.InlineKeyboardButton(f"✏️ {c[1]}", callback_data=f"do_edit_cat_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_edit_menu"))
+        bot.edit_message_text("تعديل تصنيف:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("do_edit_cat_"):
+        bot.send_message(uid, "الاسم الجديد:")
+        admin_states[uid] = {"action": "edit_cat_name", "id": int(data.split("_")[3])}
+    elif data == "adm_edit_grp_list":
+        cats = db_query("SELECT * FROM categories", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for c in cats: mk.add(types.InlineKeyboardButton(f"📂 {c[1]}", callback_data=f"list_edit_grp_{c[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_edit_menu"))
+        bot.edit_message_text("اختر التصنيف:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("list_edit_grp_"):
+        cid = int(data.split("_")[3])
+        grps = db_query("SELECT * FROM groups WHERE category_id=?", (cid,), fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(f"✏️ {g[2]}", callback_data=f"sel_edit_grp_{g[0]}"))
+        bot.edit_message_text("تعديل مجموعة:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("sel_edit_grp_"):
+        gid = int(data.split("_")[3])
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("الاسم", callback_data=f"do_edit_grp_name_{gid}"), types.InlineKeyboardButton("الصورة", callback_data=f"do_edit_grp_img_{gid}"))
+        bot.edit_message_text("ماذا تعدل؟", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("do_edit_grp_name_"):
+        bot.send_message(uid, "الاسم الجديد:")
+        admin_states[uid] = {"action": "edit_grp_name", "id": int(data.split("_")[4])}
+    elif data.startswith("do_edit_grp_img_"):
+        bot.send_message(uid, "الرابط الجديد (أو no):")
+        admin_states[uid] = {"action": "edit_grp_img", "id": int(data.split("_")[4])}
+    elif data == "adm_edit_prod_list":
+        grps = db_query("SELECT * FROM groups", fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for g in grps: mk.add(types.InlineKeyboardButton(f"🎮 {g[2]}", callback_data=f"list_edit_prod_{g[0]}"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="adm_edit_menu"))
+        bot.edit_message_text("اختر المجموعة:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("list_edit_prod_"):
+        gid = int(data.split("_")[3])
+        prods = db_query("SELECT * FROM products WHERE group_id=?", (gid,), fetch=True)
+        mk = types.InlineKeyboardMarkup()
+        for p in prods: mk.add(types.InlineKeyboardButton(f"✏️ {p[2]}", callback_data=f"sel_edit_prod_{p[0]}"))
+        bot.edit_message_text("اختر المنتج:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("sel_edit_prod_"):
+        pid = int(data.split("_")[3])
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("الاسم", callback_data=f"do_edit_prod_name_{pid}"), types.InlineKeyboardButton("السعر SYR", callback_data=f"do_edit_prod_price_{pid}"))
+        mk.add(types.InlineKeyboardButton("السعر USD", callback_data=f"do_edit_prod_usd_{pid}"), types.InlineKeyboardButton("API ID", callback_data=f"do_edit_prod_api_{pid}"))
+        bot.edit_message_text("تعديل المنتج:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("do_edit_prod_name_"):
+        bot.send_message(uid, "الاسم الجديد:")
+        admin_states[uid] = {"action": "edit_prod_name", "id": int(data.split("_")[4])}
+    elif data.startswith("do_edit_prod_price_"):
+        bot.send_message(uid, "السعر الجديد (بالليرة SYR):")
+        admin_states[uid] = {"action": "edit_prod_price", "id": int(data.split("_")[4])}
+    elif data.startswith("do_edit_prod_usd_"):
+        bot.send_message(uid, "السعر الجديد (بالدولار USD) - أرسل 0 لإلغاء التسعير بالدولار:")
+        admin_states[uid] = {"action": "edit_prod_usd", "id": int(data.split("_")[4])}
+    elif data.startswith("do_edit_prod_api_"):
+        bot.send_message(uid, "API ID الجديد (0 ليدوي):")
+        admin_states[uid] = {"action": "edit_prod_api", "id": int(data.split("_")[4])}
+
+    # --- إدارة الأرصدة والمستويات (زر سريع) ---
+    elif data == "adm_quick_level":
+        if uid != ADMIN_ID: return
+        bot.send_message(uid, "🏅 **تغيير المستوى السريع**\nأرسل الآيدي (ID) للمستخدم لتغيير مستواه فوراً:", parse_mode="Markdown")
+        admin_states[uid] = {"action": "adm_quick_lvl_id"}
+
+    elif data == "adm_manage_balance":
+        if uid != ADMIN_ID: return
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ إضافة رصيد", callback_data="adm_bal_add"),
+               types.InlineKeyboardButton("➖ خصم رصيد", callback_data="adm_bal_deduct"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("إدارة الأرصدة:", uid, call.message.message_id, reply_markup=mk)
+
+    elif data == "adm_bal_add":
+        bot.send_message(uid, "ID المستخدم:")
+        admin_states[uid] = {"action": "adm_bal_add_id"}
+    elif data == "adm_bal_deduct":
+        bot.send_message(uid, "ID المستخدم:")
+        admin_states[uid] = {"action": "adm_bal_deduct_id"}
+
+    # --- باقي الأدوات + [الجديد] ---
+    elif data == "adm_broadcast":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("نص", callback_data="brd_text"), types.InlineKeyboardButton("صورة", callback_data="brd_photo"))
+        bot.edit_message_text("نوع الإشعار:", uid, call.message.message_id, reply_markup=mk)
+    elif data == "brd_text":
+        bot.send_message(uid, "النص:")
+        admin_states[uid] = {"action": "broadcast_text"}
+    elif data == "brd_photo":
+        bot.send_message(uid, "الصورة مع الكابشن:")
+        admin_states[uid] = {"action": "broadcast_photo"}
+    
+    # [جديد] سعر الصرف
+    elif data == "adm_set_rate":
+        current = get_setting("dollar_rate")
+        bot.send_message(uid, f"💲 سعر الصرف الحالي: **{current}**\nأرسل السعر الجديد (يدعم الفواصل، مثال: 15200.5):", parse_mode="Markdown")
+        admin_states[uid] = {"action": "set_dollar_rate"}
+
+    # [جديد] تعليمات السيرفر
+    elif data == "adm_server_help":
+        msg = """
+☁️ **تعليمات رفع البوت على سيرفر (VPS/Ubuntu):**
+
+1. احجز سيرفر (Ubuntu 20.04+).
+2. اتصل عبر SSH.
+3. نفذ الأوامر التالية لتجهيز البيئة:
+`sudo apt update && sudo apt install python3-pip screen -y`
+`pip3 install pyTelegramBotAPI requests`
+
+4. ارفع ملف البوت `bot.py` وملف قاعدة البيانات (إن وجد) إلى السيرفر.
+5. لتشغيل البوت في الخلفية:
+`screen -S bot`
+`python3 bot.py`
+اضغط `Ctrl+A` ثم `D` للخروج من الشاشة مع إبقاء البوت يعمل.
+
+⚠️ **للاستضافة المجانية:** يمكنك استخدام موقع Render أو Railway مع ملف `requirements.txt` يحتوي على:
+`pyTelegramBotAPI`
+`requests`
+        """
+        bot.edit_message_text(msg, uid, call.message.message_id, parse_mode="Markdown", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("رجوع", callback_data="admin_panel")))
+
+    # [جديد] التبديلات (Toggles)
+    elif data == "adm_toggle_mediator":
+        curr = get_setting("enable_mediator")
+        new_val = "1" if curr == "0" else "0"
+        set_setting("enable_mediator", new_val)
+        status = "✅ مفعل" if new_val=="1" else "❌ معطل"
+        bot.answer_callback_query(call.id, f"نظام الوسيط: {status}")
+        bot.edit_message_text(f"نظام الوسيط: {status}", uid, call.message.message_id, reply_markup=admin_menu())
+
+    elif data == "adm_toggle_user_cur":
+        curr = get_setting("enable_user_currency")
+        new_val = "1" if curr == "0" else "0"
+        set_setting("enable_user_currency", new_val)
+        status = "✅ مفعل" if new_val=="1" else "❌ معطل"
+        bot.answer_callback_query(call.id, f"تبديل العملة للزبائن: {status}")
+        bot.edit_message_text(f"تبديل العملة: {status}", uid, call.message.message_id, reply_markup=admin_menu())
+
+    elif data == "adm_maintenance":
+        status = get_setting("maintenance")
+        mk = types.InlineKeyboardMarkup()
+        if status == "0": mk.add(types.InlineKeyboardButton("🛑 تشغيل الصيانة", callback_data="set_maint_on"))
+        else: mk.add(types.InlineKeyboardButton("✅ إيقاف الصيانة", callback_data="set_maint_off"))
+        mk.add(types.InlineKeyboardButton("رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(f"الصيانة: {'مفعلة' if status=='1' else 'متوقفة'}", uid, call.message.message_id, reply_markup=mk)
+    elif data == "set_maint_on":
+        bot.send_message(uid, "رسالة التوقف:")
+        admin_states[uid] = {"action": "maint_on_msg"}
+    elif data == "set_maint_off":
+        bot.send_message(uid, "رسالة العودة:")
+        admin_states[uid] = {"action": "maint_off_msg"}
+
+    elif data == "adm_texts":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("/start", callback_data="edit_txt_start"), types.InlineKeyboardButton("دعم", callback_data="edit_txt_support"), types.InlineKeyboardButton("شروط", callback_data="edit_txt_terms"))
+        mk.add(types.InlineKeyboardButton("رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("اختر النص:", uid, call.message.message_id, reply_markup=mk)
+    elif data.startswith("edit_txt_"):
+        key = {"start": "start_msg", "support": "support_msg", "terms": "terms_msg"}[data.split("_")[2]]
+        bot.send_message(uid, f"النص الجديد لـ {key}:")
+        admin_states[uid] = {"action": "save_text", "key": key}
+
+    elif data == "adm_methods":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("➕ إضافة", callback_data="adm_add_method"))
+        for m in db_query("SELECT * FROM payment_methods", fetch=True): mk.add(types.InlineKeyboardButton(f"🗑 {m[1]}", callback_data=f"del_meth_{m[0]}"))
+        mk.add(types.InlineKeyboardButton("رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("طرق الدفع:", uid, call.message.message_id, reply_markup=mk)
+    elif data == "adm_add_method":
+        bot.send_message(uid, "الاسم:")
+        admin_states[uid] = {"action": "add_meth_name"}
+    elif data.startswith("del_meth_"):
+        db_query("DELETE FROM payment_methods WHERE id=?", (int(data.split("_")[2]),), commit=True)
+        bot.answer_callback_query(call.id, "حذف")
+        handle_callback(call)
+
+    # --- الطلبات المالية ---
+    elif data == "adm_transactions":
+        trans = db_query("SELECT * FROM transactions WHERE status='pending'", fetch=True)
+        if not trans:
+            bot.answer_callback_query(call.id, "لا يوجد طلبات", show_alert=True)
+            return
+        for t in trans:
+            uname = get_user(t[1])[1]
+            txt = f"📝 {t[2]}\n👤 @{uname}\n💰 {t[3]}\n💳 {t[4]}\n📅 {t[8]}"
+            if t[2]=="withdraw": txt+=f"\nرقم: `{t[5]}`"
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton("✅", callback_data=f"acc_trans_{t[0]}"), types.InlineKeyboardButton("❌", callback_data=f"rej_trans_{t[0]}"))
+            if t[6]: 
+                try: bot.send_photo(uid, t[6], caption=txt, reply_markup=mk)
+                except: bot.send_message(uid, txt, reply_markup=mk)
+            else: bot.send_message(uid, txt, reply_markup=mk)
+
+    elif data.startswith("acc_trans_"):
+        tid = int(data.split("_")[2])
+        t = db_query("SELECT * FROM transactions WHERE id=?", (tid,), fetch=True)[0]
+        if t[2] == "deposit":
+            db_query("UPDATE users SET balance = balance + ? WHERE id=?", (t[3], t[1]), commit=True)
+            try: bot.send_message(t[1], f"✅ تم قبول إيداعك: {t[3]}")
+            except: pass
+        else:
+            try: bot.send_message(t[1], "✅ تم تحويل السحب")
+            except: pass
+        db_query("UPDATE transactions SET status='approved' WHERE id=?", (tid,), commit=True)
+        bot.delete_message(uid, call.message.message_id)
+
+    elif data.startswith("rej_trans_"):
+        tid = int(data.split("_")[2])
+        t = db_query("SELECT * FROM transactions WHERE id=?", (tid,), fetch=True)[0]
+        if t[2] == "withdraw":
+            total = int(t[3] * (1 + WITHDRAW_FEE_PERCENT/100))
+            db_query("UPDATE users SET balance = balance + ? WHERE id=?", (total, t[1]), commit=True)
+        try: bot.send_message(t[1], f"❌ تم رفض طلب {t[2]}")
+        except: pass
+        db_query("UPDATE transactions SET status='rejected' WHERE id=?", (tid,), commit=True)
+        bot.delete_message(uid, call.message.message_id)
+
+    # --- المستخدمين ---
+    elif data == "adm_users":
+        mk = types.InlineKeyboardMarkup()
+        mk.add(types.InlineKeyboardButton("🔎 بحث بالآيدي", callback_data="adm_search_user"))
+        mk.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="admin_panel"))
+        bot.edit_message_text("المستخدمين:", uid, call.message.message_id, reply_markup=mk)
+    elif data == "adm_search_user":
+        bot.send_message(uid, "ID المستخدم:")
+        admin_states[uid] = {"action": "search_user"}
+
+    # --- المستويات ---
+    elif data == "adm_levels":
+        lvls = db_query("SELECT * FROM levels ORDER BY level_id ASC", fetch=True)
+        txt = "💎 **إعدادات المستويات (مطلوب للوصول - خصم):**\n"
+        mk = types.InlineKeyboardMarkup()
+        for l in lvls:
+            txt += f"L{l[0]} {l[1]}: خصم {l[2]}% | مطلوب إنفاق {l[3]}\n"
+            mk.add(types.InlineKeyboardButton(f"تعديل L{l[0]}", callback_data=f"edit_lvl_{l[0]}"))
+        mk.add(types.InlineKeyboardButton("رجوع", callback_data="admin_panel"))
+        bot.edit_message_text(txt, uid, call.message.message_id, parse_mode="Markdown", reply_markup=mk)
+    elif data.startswith("edit_lvl_"):
+        lid = int(data.split("_")[2])
+        bot.send_message(uid, f"تعديل مستوى {lid}\nأرسل: `الاسم-الخصم-الانفاق_المطلوب`\nمثال: `ماسي-12-300000`", parse_mode="Markdown")
+        admin_states[uid] = {"action": "update_level", "lid": lid}
+
+# ================= الصور =================
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    uid = message.from_user.id
+    if uid in admin_states:
+        st = admin_states[uid]
+        if st["action"] == "dep_wait_proof":
+            fid = message.photo[-1].file_id
+            db_query("INSERT INTO transactions (user_id, type, amount, method_name, proof_image, status, date) VALUES (?,?,?,?,?,?,?)",
+                     (uid, "deposit", st["amount"], st["method_name"], fid, "pending", int(time.time())), commit=True)
+            bot.send_message(uid, "✅ تم إرسال الإشعار.")
+            bot.send_message(ADMIN_ID, f"🔔 إيداع جديد: {st['amount']}")
+            del admin_states[uid]
+        elif st["action"] == "broadcast_photo":
+            c = broadcast_message(message.caption or "", message.photo[-1].file_id)
+            bot.send_message(uid, f"✅ تم الإرسال لـ {c}")
+            del admin_states[uid]
+
+# ================= النصوص =================
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    uid = message.from_user.id
+    txt = message.text.strip()
+    
+    if uid in admin_states:
+        st = admin_states[uid]
+        
+        # --- الشراء العادي (منتج ليس كميات) ---
+        if st["action"] == "wait_player_id":
+            prod = db_query("SELECT * FROM products WHERE id=?", (st["prod_id"],), fetch=True)[0]
+            # السعر المحسوب مسبقاً والمخزن في الـ state
+            price = st["price"]
+            cost = prod[6] if len(prod) > 6 else 0
+            
+            db_query("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE id=?", (price, price, uid), commit=True)
+            seq_id = str(get_next_order_id())
+            bot.send_message(uid, f"✅ **تم استلام طلبك بنجاح!**\n🔢 رقم الطلب: `{seq_id}`\n⏳ الطلب قيد المعالجة...", parse_mode="Markdown")
+            
+            check_auto_promotion(uid, get_user(uid)[4], get_user(uid)[3])
+            success, api_msg = execute_big_boss_order(uid, txt, prod[4])
+            
+            if api_msg == "MANUAL_PROCESSING":
+                db_query("INSERT INTO orders (order_id, user_id, product_name, price_paid, api_status, created_at, status, quantity, cost_at_purchase) VALUES (?,?,?,?,?,?,?,1,?)", 
+                         (seq_id, uid, prod[2], price, "Manual", int(time.time()), "pending_manual", cost), commit=True)
+                bot.send_message(ADMIN_ID, f"🔔 **طلب يدوي جديد #{seq_id}**\n👤 @{message.from_user.username}\n📦 المنتج: {prod[2]}\n🆔 الآيدي: `{txt}`\n💰 السعر: {price}")
+            else:
+                status = "completed" if success else "failed"
+                db_query("INSERT INTO orders (order_id, user_id, product_name, price_paid, api_status, created_at, status, quantity, cost_at_purchase) VALUES (?,?,?,?,?,?,?,1,?)", 
+                         (seq_id, uid, prod[2], price, api_msg, int(time.time()), status, cost), commit=True)
+                if success:
+                    bot.send_message(uid, f"✅ **تم تنفيذ الطلب #{seq_id}**\n{api_msg}")
+                    bot.send_message(ADMIN_ID, f"✅ طلب تلقائي ناجح #{seq_id}\n📦 {prod[2]}")
+                else:
+                    db_query("UPDATE users SET balance = balance + ?, total_spent = total_spent - ? WHERE id=?", (price, price, uid), commit=True)
+                    bot.send_message(uid, f"⚠️ **فشل الطلب #{seq_id}**\nالسبب: {api_msg}\n💰 تم إعادة الرصيد.")
+            del admin_states[uid]
+
+        # --- [آلة حاسبة] الشراء بنظام الكميات ---
+        elif st["action"] == "wait_qty_input":
+            if not txt.isdigit(): return bot.send_message(uid, "الرجاء إدخال رقم صحيح للكمية:")
+            qty = int(txt)
+            min_qty = st.get("min_qty", 1)
+            if qty < min_qty: return bot.send_message(uid, f"⚠️ أقل كمية مسموحة: {min_qty}")
+            
+            prod_info = db_query("SELECT * FROM products WHERE id=?", (st["prod_id"],), fetch=True)[0]
+            
+            # [جديد] استخدام دالة حساب السعر الحقيقي
+            unit_price_real = get_product_real_price_syr(prod_info)
+            base_total = unit_price_real * qty
+            
+            final_total = calculate_final_price(base_total, get_user(uid)[3])
+            
+            if get_user(uid)[2] < final_total:
+                bot.send_message(uid, f"🚫 رصيدك غير كاف!\nالمطلوب لـ {qty} قطعة: **{final_total} SYR**")
+                del admin_states[uid]
+                return
+            
+            st["qty"] = qty
+            st["final_total"] = final_total
+            st["action"] = "wait_id_qty_mode"
+            bot.send_message(uid, f"✅ الكمية: {qty}\n💰 الإجمالي: **{final_total} SYR**\n\n🆔 **الآن أرسل الآيدي (ID):**", parse_mode="Markdown")
+
+        elif st["action"] == "wait_id_qty_mode":
+            player_id = txt
+            qty = st["qty"]
+            price = st["final_total"]
+            prod_info = db_query("SELECT * FROM products WHERE id=?", (st["prod_id"],), fetch=True)[0]
+            cost_unit = prod_info[6] if len(prod_info) > 6 else 0
+            total_cost = cost_unit * qty
+            
+            db_query("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE id=?", (price, price, uid), commit=True)
+            seq_id = str(get_next_order_id())
+            bot.send_message(uid, f"✅ **تم استلام الطلب!**\n🔢 #{seq_id}\n⏳ معالجة...", parse_mode="Markdown")
+            
+            check_auto_promotion(uid, get_user(uid)[4], get_user(uid)[3])
+            success, api_msg = execute_big_boss_order(uid, player_id, prod_info[4], qty)
+            prod_name_qty = f"{prod_info[2]} (x{qty})"
+            
+            if api_msg == "MANUAL_PROCESSING":
+                db_query("INSERT INTO orders (order_id, user_id, product_name, price_paid, api_status, created_at, status, quantity, cost_at_purchase) VALUES (?,?,?,?,?,?,?,?,?)", 
+                         (seq_id, uid, prod_name_qty, price, "Manual", int(time.time()), "pending_manual", qty, total_cost), commit=True)
+                bot.send_message(ADMIN_ID, f"🔔 **طلب كميات يدوي #{seq_id}**\n👤 @{message.from_user.username}\n📦 {prod_name_qty}\n🆔 `{player_id}`")
+            else:
+                status = "completed" if success else "failed"
+                db_query("INSERT INTO orders (order_id, user_id, product_name, price_paid, api_status, created_at, status, quantity, cost_at_purchase) VALUES (?,?,?,?,?,?,?,?,?)", 
+                         (seq_id, uid, prod_name_qty, price, api_msg, int(time.time()), status, qty, total_cost), commit=True)
+                if success: 
+                    bot.send_message(uid, f"✅ **تم تنفيذ الطلب #{seq_id}**\n{api_msg}")
+                    bot.send_message(ADMIN_ID, f"✅ طلب كميات ناجح #{seq_id}")
+                else: 
+                    db_query("UPDATE users SET balance = balance + ?, total_spent = total_spent - ? WHERE id=?", (price, price, uid), commit=True)
+                    bot.send_message(uid, f"⚠️ **فشل الطلب #{seq_id}**\n{api_msg}\n💰 تم إعادة الرصيد.")
+            del admin_states[uid]
+
+        # --- سبب رفض الطلب المعلق ---
+        elif st["action"] == "reject_manual_reason":
+            oid = st["oid"]
+            o = db_query("SELECT * FROM orders WHERE order_id=?", (oid,), fetch=True)[0]
+            db_query("UPDATE users SET balance = balance + ?, total_spent = total_spent - ? WHERE id=?", (o[3], o[3], o[1]), commit=True)
+            db_query("UPDATE orders SET status='refunded' WHERE order_id=?", (oid,), commit=True)
+            try: bot.send_message(o[1], f"❌ **تم رفض طلبك #{oid}**\nالسبب: {txt}\n💰 تم استرجاع الرصيد.")
+            except: pass
+            bot.send_message(uid, "✅ تم الرفض وإعادة الرصيد.")
+            del admin_states[uid]
+
+        # المالية
+        elif st["action"] == "dep_wait_amount":
+            if not txt.isdigit(): return
+            st["amount"] = int(txt)
+            st["action"] = "dep_wait_proof"
+            bot.send_message(uid, "📸 صورة الإيصال:")
+        elif st["action"] == "wd_wait_amount":
+            if not txt.isdigit(): return
+            amt = int(txt)
+            total = int(amt * (1 + WITHDRAW_FEE_PERCENT/100))
+            if get_user(uid)[2] < total:
+                bot.send_message(uid, f"❌ رصيد غير كاف. مطلوب: {total}")
+                del admin_states[uid]
+                return
+            st["amount"] = amt
+            st["total"] = total
+            st["action"] = "wd_wait_num"
+            bot.send_message(uid, f"سيخصم {total}. رقم المحفظة:")
+        elif st["action"] == "wd_wait_num":
+            db_query("UPDATE users SET balance = balance - ? WHERE id=?", (st["total"], uid), commit=True)
+            db_query("INSERT INTO transactions (user_id, type, amount, method_name, user_account, status, date) VALUES (?,?,?,?,?,?,?)",
+                     (uid, "withdraw", st["amount"], st["method_name"], txt, "pending", int(time.time())), commit=True)
+            bot.send_message(uid, "✅ تم طلب السحب")
+            bot.send_message(ADMIN_ID, f"🔔 سحب: {st['amount']}")
+            del admin_states[uid]
+
+        # التعديلات
+        elif st["action"] == "edit_cat_name":
+            db_query("UPDATE categories SET name=? WHERE id=?", (txt, st["id"]), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "edit_grp_name":
+            db_query("UPDATE groups SET name=? WHERE id=?", (txt, st["id"]), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "edit_grp_img":
+            img = txt if txt.lower() != 'no' else None
+            db_query("UPDATE groups SET image_url=? WHERE id=?", (img, st["id"]), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "edit_prod_name":
+            db_query("UPDATE products SET name=? WHERE id=?", (txt, st["id"]), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "edit_prod_price":
+            try:
+                price = float(txt)
+                db_query("UPDATE products SET price=? WHERE id=?", (price, st["id"]), commit=True)
+                bot.send_message(uid, "✅ تم")
+                del admin_states[uid]
+            except ValueError:
+                bot.send_message(uid, "❌ الرجاء إرسال رقم صحيح")
+        # [جديد] تعديل السعر بالدولار
+        elif st["action"] == "edit_prod_usd":
+            try:
+                price = float(txt)
+                db_query("UPDATE products SET price_usd=? WHERE id=?", (price, st["id"]), commit=True)
+                bot.send_message(uid, "✅ تم تحديث السعر بالدولار")
+                del admin_states[uid]
+            except ValueError:
+                bot.send_message(uid, "❌ رقم غير صحيح")
+
+        elif st["action"] == "edit_prod_api":
+            db_query("UPDATE products SET api_product_id=? WHERE id=?", (txt, st["id"]), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+
+        # إضافة
+        elif st["action"] == "add_cat":
+            db_query("INSERT INTO categories (name) VALUES (?)", (txt,), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "add_grp_name":
+            st["grp_name"] = txt
+            st["action"] = "add_grp_img"
+            bot.send_message(uid, "الصورة (أو no):")
+        elif st["action"] == "add_grp_img":
+            img = txt if txt.lower() != 'no' else None
+            db_query("INSERT INTO groups (category_id, name, image_url) VALUES (?,?,?)", (st["cid"], st["grp_name"], img), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        
+        # [جديد] إضافة وسيط
+        elif st["action"] == "add_med_name":
+            db_query("INSERT INTO mediators (group_id, name) VALUES (?, ?)", (st["gid"], txt), commit=True)
+            bot.send_message(uid, "✅ تم إضافة الوسيط")
+            del admin_states[uid]
+
+        # إضافة منتج (السلسلة المعدلة لدعم الدولار والوسيط)
+        elif st["action"] == "add_prod_name":
+            st["prod_name"] = txt
+            st["action"] = "add_prod_price_choice"
+            mk = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            mk.add("SYR (ليرة سورية)", "USD (دولار)")
+            bot.send_message(uid, "بأي عملة تريد تسعير المنتج؟", reply_markup=mk)
+
+        elif st["action"] == "add_prod_price_choice":
+            if txt == "USD (دولار)":
+                st["is_usd_pricing"] = True
+                bot.send_message(uid, "💰 أرسل السعر بالدولار (مثال: 1.5):", reply_markup=types.ReplyKeyboardRemove())
+            else:
+                st["is_usd_pricing"] = False
+                bot.send_message(uid, "💰 أرسل السعر بالليرة (مثال: 15000):", reply_markup=types.ReplyKeyboardRemove())
+            st["action"] = "add_prod_price_val"
+
+        elif st["action"] == "add_prod_price_val":
+            try:
+                val = float(txt)
+                if st["is_usd_pricing"]:
+                    st["prod_usd"] = val
+                    st["prod_price"] = 0 # Dummy value for SYR column if using USD
+                else:
+                    st["prod_usd"] = 0
+                    st["prod_price"] = val
+                
+                st["action"] = "add_prod_cost"
+                bot.send_message(uid, "📉 **سعر التكلفة عليك** (لحساب الأرباح - بالليرة):")
+            except ValueError:
+                bot.send_message(uid, "⚠️ أرسل رقماً صحيحاً:")
+
+        elif st["action"] == "add_prod_cost":
+            try:
+                st["cost_price"] = float(txt)
+                st["action"] = "add_prod_api"
+                bot.send_message(uid, "API ID (0 ليدوي):")
+            except ValueError:
+                bot.send_message(uid, "⚠️ أرسل رقماً صحيحاً:")
+
+        elif st["action"] == "add_prod_api":
+            st["prod_api"] = txt
+            st["action"] = "add_prod_is_qty"
+            mk = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            mk.add("نعم (آلة حاسبة)", "لا (باقة ثابتة)")
+            bot.send_message(uid, "هل المنتج يتطلب تحديد كمية (مثل النقاط)؟", reply_markup=mk)
+        
+        elif st["action"] == "add_prod_is_qty":
+            # تحضير القيم للإدخال
+            p_name = st["prod_name"]
+            p_price = st["prod_price"]
+            p_usd = st["prod_usd"]
+            p_cost = st["cost_price"]
+            p_api = st["prod_api"]
+            gid = st["gid"]
+            med_id = st.get("med_id", 0) # افتراضي 0 اذا لم يتم تحديده
+
+            if txt == "نعم (آلة حاسبة)":
+                st["is_qty"] = 1
+                st["action"] = "add_prod_min_qty"
+                bot.send_message(uid, "🔢 أقل كمية للطلب:", reply_markup=types.ReplyKeyboardRemove())
+            else:
+                # إضافة المنتج الثابت
+                db_query("INSERT INTO products (group_id, name, price, cost_price, api_product_id, is_quantity, min_qty, price_usd, mediator_id) VALUES (?,?,?,?,?,0,1,?,?)", 
+                         (gid, p_name, p_price, p_cost, p_api, p_usd, med_id), commit=True)
+                bot.send_message(uid, "✅ تم إضافة المنتج (ثابت)!", reply_markup=types.ReplyKeyboardRemove())
+                del admin_states[uid]
+
+        elif st["action"] == "add_prod_min_qty":
+            if not txt.isdigit(): return
+            min_qty = int(txt)
+            p_name = st["prod_name"]
+            p_price = st["prod_price"]
+            p_usd = st["prod_usd"]
+            p_cost = st["cost_price"]
+            p_api = st["prod_api"]
+            gid = st["gid"]
+            med_id = st.get("med_id", 0)
+
+            db_query("INSERT INTO products (group_id, name, price, cost_price, api_product_id, is_quantity, min_qty, price_usd, mediator_id) VALUES (?,?,?,?,?,1,?,?,?)", 
+                     (gid, p_name, p_price, p_cost, p_api, min_qty, p_usd, med_id), commit=True)
+            bot.send_message(uid, f"✅ تم إضافة المنتج (كميات)!\nأقل كمية: {min_qty}", reply_markup=types.ReplyKeyboardRemove())
+            del admin_states[uid]
+
+        # إعدادات السحب
+        elif st["action"] == "set_raf_fee":
+            if not txt.isdigit(): return
+            set_setting("raffle_fee", txt)
+            bot.send_message(uid, "✅ تم تحديث سعر الاشتراك")
+            del admin_states[uid]
+        elif st["action"] == "set_raf_prize":
+            if not txt.isdigit(): return
+            set_setting("raffle_prize", txt)
+            bot.send_message(uid, "✅ تم تحديث قيمة الجائزة")
+            del admin_states[uid]
+        
+        # [جديد] تعيين سعر الصرف
+        elif st["action"] == "set_dollar_rate":
+            try:
+                rate = float(txt)
+                set_setting("dollar_rate", str(rate))
+                bot.send_message(uid, f"✅ تم تحديث سعر الصرف إلى: {rate}")
+                del admin_states[uid]
+            except:
+                bot.send_message(uid, "⚠️ رقم غير صحيح")
+
+        # إدارة متنوعة
+        elif st["action"] == "save_text":
+            set_setting(st["key"], txt)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "add_meth_name":
+            st["mname"] = txt
+            st["action"] = "add_meth_num"
+            bot.send_message(uid, "رقم المحفظة:")
+        elif st["action"] == "add_meth_num":
+            st["mnum"] = txt
+            st["action"] = "add_meth_desc"
+            bot.send_message(uid, "تعليمات:")
+        elif st["action"] == "add_meth_desc":
+            db_query("INSERT INTO payment_methods (name, account_number, details) VALUES (?,?,?)", (st["mname"], st["mnum"], txt), commit=True)
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "update_level":
+            try:
+                n, d, c = txt.split("-")
+                db_query("UPDATE levels SET name=?, discount_percent=?, upgrade_cost=? WHERE level_id=?", (n, float(d), int(c), st["lid"]), commit=True)
+                bot.send_message(uid, "✅ تم التحديث")
+            except: bot.send_message(uid, "خطأ تنسيق")
+            del admin_states[uid]
+        
+        # البحث
+        elif st["action"] == "search_user":
+            if not txt.isdigit(): return
+            u = get_user(int(txt))
+            if not u: return bot.send_message(uid, "غير موجود")
+            lvl = get_level_info(u[3])
+            info = f"👤 {u[1]} (ID: {u[0]})\n💰 {u[2]}\n⭐ {lvl[1]}"
+            mk = types.InlineKeyboardMarkup()
+            mk.add(types.InlineKeyboardButton("تغيير المستوى", callback_data=f"set_manual_lvl_{u[0]}"))
+            if u[5]: mk.add(types.InlineKeyboardButton("فك الحظر", callback_data=f"unban_{u[0]}"))
+            else: mk.add(types.InlineKeyboardButton("حظر", callback_data=f"ban_{u[0]}"))
+            bot.send_message(uid, info, reply_markup=mk)
+            del admin_states[uid]
+            
+        elif st["action"] == "adm_quick_lvl_id":
+            if not txt.isdigit(): return
+            u = get_user(int(txt))
+            if not u: return bot.send_message(uid, "غير موجود")
+            mk = types.InlineKeyboardMarkup()
+            for l in db_query("SELECT * FROM levels", fetch=True):
+                mk.add(types.InlineKeyboardButton(f"{l[1]}", callback_data=f"do_set_lvl_{u[0]}_{l[0]}"))
+            bot.send_message(uid, f"اختر المستوى الجديد لـ {u[1]}:", reply_markup=mk)
+            del admin_states[uid]
+
+        # الأرصدة
+        elif st["action"] == "adm_bal_add_id":
+            st["tid"] = int(txt)
+            st["action"] = "adm_bal_add_amt"
+            bot.send_message(uid, "المبلغ:")
+        elif st["action"] == "adm_bal_add_amt":
+            amt = int(txt)
+            db_query("UPDATE users SET balance = balance + ? WHERE id=?", (amt, st["tid"]), commit=True)
+            bot.send_message(uid, f"✅ تم إضافة {amt}")
+            try: bot.send_message(st["tid"], f"💰 تم إضافة {amt} لرصيدك")
+            except: pass
+            del admin_states[uid]
+        elif st["action"] == "adm_bal_deduct_id":
+            st["tid"] = int(txt)
+            st["action"] = "adm_bal_deduct_amt"
+            bot.send_message(uid, "المبلغ:")
+        elif st["action"] == "adm_bal_deduct_amt":
+            amt = int(txt)
+            db_query("UPDATE users SET balance = balance - ? WHERE id=?", (amt, st["tid"]), commit=True)
+            bot.send_message(uid, f"✅ تم خصم {amt}")
+            del admin_states[uid]
+        elif st["action"] == "broadcast_text":
+            c = broadcast_message(txt)
+            bot.send_message(uid, f"✅ تم لـ {c}")
+            del admin_states[uid]
+        elif st["action"] == "maint_on_msg":
+            set_setting("maintenance", "1")
+            broadcast_message(f"⚠️ صيانة:\n{txt}")
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+        elif st["action"] == "maint_off_msg":
+            set_setting("maintenance", "0")
+            broadcast_message(f"✅ عدنا:\n{txt}")
+            bot.send_message(uid, "✅ تم")
+            del admin_states[uid]
+
+# Callback لتغيير المستوى والحظر
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ban_") or c.data.startswith("unban_") or c.data.startswith("set_manual_lvl_"))
+def user_action(call):
+    if call.from_user.id != ADMIN_ID: return
+    
+    if call.data.startswith("set_manual_lvl_"):
+        tid = int(call.data.split("_")[3])
+        mk = types.InlineKeyboardMarkup()
+        for l in db_query("SELECT * FROM levels", fetch=True):
+            mk.add(types.InlineKeyboardButton(f"{l[1]}", callback_data=f"do_set_lvl_{tid}_{l[0]}"))
+        bot.edit_message_text("اختر المستوى:", ADMIN_ID, call.message.message_id, reply_markup=mk)
+        return
+
+    act, tid = call.data.split("_")
+    val = 1 if act == "ban" else 0
+    db_query("UPDATE users SET banned=? WHERE id=?", (val, tid), commit=True)
+    bot.answer_callback_query(call.id, "تم")
+
+print("Bot Ultimate Pro V14 (Dollar + Mediator) Started...")
+bot.infinity_polling()
